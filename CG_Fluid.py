@@ -1,24 +1,12 @@
-# 1. 有ti.grouped的具体解释吗？ 在文档里面好像没有找到. 如果I是一个向量，那这个向量里面的元素是什么样子的呢？是如何随着循环变化的呢
-# 2. tichi有没有reshape tensor的功能呢？比如把一个shape = n*m 的var tensor变成一个 shape = (n, m) 的tensor呢？
-# Reference:
-# advection.py
-# stable_fluid.py
-# http://developer.download.nvidia.com/books/HTML/gpugems/gpugems_ch38.html
-# https://github.com/tunabrain/incremental-fluids
-# https://forum.taichi.graphics/
-
-# Traits:
-# Simplest: Not staggered.
-
 import taichi as ti
 import Util
+
 
 ti.init(arch=ti.gpu)
 
 # General settings:
 resolutionX = 512
 pixels = ti.var(ti.f32, shape=(resolutionX, resolutionX))
-p_matrix = ti.var(ti.f32, shape=(resolutionX * resolutionX, resolutionX * resolutionX))
 dt = 0.02
 dx = 1.0
 inv_dx = 1.0 / dx
@@ -41,9 +29,18 @@ _new_pressures = ti.var(dt=ti.f32, shape=(resolutionX, resolutionX))
 _diff_pressures = ti.var(dt=ti.f32, shape=(resolutionX, resolutionX))
 _dye_buffer = ti.var(dt=ti.f32, shape=(resolutionX, resolutionX))
 _new_dye_buffer = ti.var(dt=ti.f32, shape=(resolutionX, resolutionX))
+
 velocities_pair = Util.TexPair(_velocities, _new_velocities)
 pressures_pair = Util.TexPair(_pressures, _new_pressures)
 dyes_pair = Util.TexPair(_dye_buffer, _new_dye_buffer)
+
+# CG settings:
+b = ti.var(dt=ti.f32, shape=resolutionX * resolutionX)
+p = ti.var(dt=ti.f32, shape=resolutionX * resolutionX)
+Ax = ti.var(dt=ti.f32, shape=resolutionX * resolutionX)
+Ap = ti.var(dt=ti.f32, shape=resolutionX * resolutionX)
+r = ti.var(dt=ti.f32, shape=resolutionX * resolutionX)
+new_r = ti.var(dt=ti.f32, shape=resolutionX * resolutionX)
 
 
 # TODO:
@@ -128,28 +125,182 @@ def fill_color(ipixels: ti.template(), idyef: ti.template()):
         ipixels[i, j] = density
 
 
+@ti.func
+def p_matrix(i: int, j: int, resX: int) -> ti.f32:
+    res = 0.0
+    row = int(i)
+    col = int(j)
+    ele_num = int(resX) * int(resX)
+    if row == col:
+        res = -4.0
+    elif ti.abs(col - row) == 1:
+        res = 1.0
+    elif (row + resX) == col:
+        res = 1.0
+    elif (row - resX) == col:
+        res = 1.0
+    if row < 0 or col < 0 or row >= ele_num or col >= ele_num:
+        res = 0.0
+    return res
+
+
+@ti.func
+def coeff_matrix(row: int, col: int) -> ti.f32:
+    # row represents target equation or vid.
+    res = 0.0
+    n = resolutionX * resolutionX
+    IY = row // resolutionX
+    IX = row - resolutionX * IY
+    if row >= n or row < 0 or col >= n or col < 0:
+        res = 0.0
+    else:
+        if (IX == IY == 0) or (IX == IY == resolutionX - 1) or (IX == 0 and IY == resolutionX - 1) or (
+                IX == resolutionX - 1 and IY == 0):
+            if row == col:
+                res = 1.0
+            else:
+                res = 0.0
+    # Can get results that is similar to convergence:
+        if row == col:
+            res = -4.0
+        elif ti.abs(col - row) == 1:
+            res = 1.0
+        elif ti.abs(col - row) == resolutionX:
+            res = 1.0
+    return res
+
+
+@ti.func
+def visit_vector(v: ti.template(), vid: int, length: int) -> ti.f32:
+    res = 0.0
+    if vid < 0 or vid >= length:
+        res = 0.0
+    else:
+        res = v[vid]
+    return res
+
+
+@ti.func
+def visit_pf_vector(pf: ti.template(), vid: int) -> ti.f32:
+    res = 0.0
+    n = resolutionX * resolutionX
+    if vid >= n or vid < 0:
+        res = 0.0
+    else:
+        IY = vid // resolutionX
+        IX = vid - resolutionX * IY
+        res = pf[IX, IY]
+        # res = p_with_boundary(pf, IX, IY)
+    return res
+
+
 @ti.kernel
-def pressure_jacobi_iter(pf: ti.template(), pf_new: ti.template(), divf: ti.template()) -> ti.f32:
-    norm_new = 0
-    norm_diff = 0
-    for i, j in pf:
-        pf_new[i, j] = 0.25 * (p_with_boundary(pf, i + 1, j) + p_with_boundary(pf, i - 1, j) +
-                               p_with_boundary(pf, i, j + 1) + p_with_boundary(pf, i, j - 1) - divf[i, j])
-        pf_diff = ti.abs(pf_new[i, j] - p_with_boundary(pf, i, j))
-        norm_new += (pf_new[i, j] * pf_new[i, j])
-        norm_diff += (pf_diff * pf_diff)
-    residual = ti.sqrt(norm_diff / norm_new)
-    if norm_new == 0:
-        residual = 0.0
-    return residual
+def pressure_cg_init(pf: ti.template(), b: ti.template()):
+    n = resolutionX * resolutionX
+
+    # TODO: Make it follow the ODEs shown in P5.
+    for row in range(n):
+        # Get vector element:
+        ve1 = visit_pf_vector(pf, row - resolutionX)
+        ve2 = visit_pf_vector(pf, row - 1)
+        ve3 = visit_pf_vector(pf, row)
+        ve4 = visit_pf_vector(pf, row + 1)
+        ve5 = visit_pf_vector(pf, row + resolutionX)
+        # Get matrix element:
+        me1 = coeff_matrix(row, row - resolutionX)
+        me2 = coeff_matrix(row, row - 1)
+        me3 = coeff_matrix(row, row)
+        me4 = coeff_matrix(row, row + 1)
+        me5 = coeff_matrix(row, row + resolutionX)
+
+        temp_Ax = me1 * ve1 + me2 * ve2 + me3 * ve3 + me4 * ve4 + me5 * ve5
+
+        Ax[row] = temp_Ax
+        r[row] = b[row] - Ax[row]
+        p[row] = r[row]
 
 
-def pressure_jacobi(pf_pair, divf: ti.template()):
+@ti.kernel
+def pressure_cg_iter(pf: ti.template()) -> ti.f32:
+    # alpha_k = rkT * rk / pkT * A * pk
+    # rkT * rk:
+    n = resolutionX * resolutionX
+    rkT_rk = 0.0
+    pkT_A_pk = 0.0
+
+    # TODO: Make it follow the ODEs shown in P5.
+    for i in range(n):
+        rkT_rk += (r[i] * r[i])
+        # Ap[i] = 0.0
+        ve1 = visit_vector(p, i - resolutionX, n)
+        ve2 = visit_vector(p, i - 1, n)
+        ve3 = visit_vector(p, i, n)
+        ve4 = visit_vector(p, i + 1, n)
+        ve5 = visit_vector(p, i + resolutionX, n)
+        # Get matrix element:
+        me1 = coeff_matrix(i, i - resolutionX)
+        me2 = coeff_matrix(i, i - 1)
+        me3 = coeff_matrix(i, i)
+        me4 = coeff_matrix(i, i + 1)
+        me5 = coeff_matrix(i, i + resolutionX)
+
+        # Calculate number:
+        temp_Ap = me1 * ve1 + me2 * ve2 + me3 * ve3 + me4 * ve4 + me5 * ve5
+        Ap[i] = temp_Ap
+        pkT_A_pk += (p[i] * temp_Ap)
+
+    alpha = rkT_rk / pkT_A_pk
+    res = 0.0
+    top = 0.0
+    bottom = 0.0
+    # xk+1 = xk + alpha * pk
+    # rk+1 = rk - alpha * A * pk
+    for i in range(n):
+        IY = i // resolutionX
+        IX = i - resolutionX * IY
+        new_pf_val = pf[IX, IY] + alpha * p[i]
+        diff = ti.abs(new_pf_val - pf[IX, IY])
+        res += (diff * diff)
+        pf[IX, IY] = new_pf_val
+        # pf[IX, IY] = p_with_boundary(pf, IX, IY) + alpha * p[i]
+        new_r_val = r[i] - alpha * Ap[i]
+        new_r[i] = new_r_val
+        top += (new_r_val * new_r_val)
+        bottom += (r[i] * r[i])
+
+    beta = top / bottom
+    for i in range(n):
+        p[i] = new_r[i] + beta * p[i]
+        # Swap:
+        r[i] = new_r[i]
+    res = ti.sqrt(res)
+    return res
+
+
+@ti.kernel
+def construct_cg_b(divf: ti.template(), b: ti.template()):
+    for IX, IY in divf:
+        # TODO: Make it follow the ODEs shown in P5.
+        if (0 < IX < resolutionX - 1) and (0 < IY < resolutionX - 1):
+            b[IY * resolutionX + IX] = divf[IX, IY]
+        else:
+            b[IY * resolutionX + IX] = 0.0
+
+@ti.kernel
+def test_dot(r1: ti.template(), r2: ti.template()) -> ti.f32:
+    res = 0.0
+    for i in range(resolutionX * resolutionX):
+        res += r1[i] * r2[i]
+    return res
+
+
+def pressure_cg(pf_pair, divf: ti.template()):
     residual = 10
     counter = 0
-    while residual > 0.001:
-        residual = pressure_jacobi_iter(pf_pair.cur, pf_pair.nxt, divf)
-        pf_pair.swap()
+    construct_cg_b(divf, b)
+    pressure_cg_init(pf_pair.cur, b)
+    while residual > 0.01:
+        residual = pressure_cg_iter(pf_pair.cur)
         counter += 1
         if counter > 30:
             break
@@ -169,6 +320,8 @@ def correct_divergence(vf: ti.template(), vf_new: ti.template(), pf: ti.template
 
 
 gui = ti.GUI('Advection schemes', (512, 512))
+frame_counter = 0
+
 while True:
     while gui.get_event(ti.GUI.PRESS):
         if gui.event.key in [ti.GUI.ESCAPE, ti.GUI.EXIT]: exit(0)
@@ -189,13 +342,13 @@ while True:
             # External forces:
             # Projection:
             divergence(velocities_pair.cur, velocity_divs)
-            pressure_jacobi(pressures_pair, velocity_divs)
+            pressure_cg(pressures_pair, velocity_divs)
             correct_divergence(velocities_pair.cur, velocities_pair.nxt, pressures_pair.cur)
-            # correct_divergence(velocities_pair.cur, velocities_pair.nxt, pressures_pair.cur)
             velocities_pair.swap()
             # Put color from dye to pixel:
         fill_color(pixels, dyes_pair.cur)
 
+    frame_counter += 1
+    filename = f'./video/frame_{frame_counter:05d}.png'
     gui.set_image(pixels.to_numpy())
-    gui.show()
-
+    gui.show(filename)

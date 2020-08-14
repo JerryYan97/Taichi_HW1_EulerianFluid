@@ -1,5 +1,7 @@
-Jiarui Yan Taichi HW1 Euler Fluid:
+Jiarui Yan Taichi HW1 Eulerian Fluid:
 ======================
+
+Jacobi method solver and Conjugate Gradient method solver.
 
 Screen shot:
 -------------
@@ -7,6 +9,13 @@ Screen shot:
 
 
 ![](./image/Capture_Nxt.PNG)
+
+Videos:
+-------------
+
+Youtube: https://youtu.be/rBOZNeJZ6xo
+
+Bilibili: https://www.bilibili.com/video/BV1354y1U7w9/
 
 
 Reference:

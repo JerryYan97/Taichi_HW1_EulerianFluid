@@ -70,4 +70,19 @@ def jacobi_iteration(iA: ti.template(), ix: ti.template(), ix_new: ti.template()
     return norm1 / norm2
 
 
+@ti.kernel
+def dot(r1: ti.template(), r2: ti.template()) -> ti.f32:
+    res = 0.0
+    for i in ti.static(range(r1.shape()[0])):
+        res += r1[i] * r2[i]
+    return res
+
+
+@ti.kernel
+def Ab_multiply(A: ti.template(), b: ti.template(), output: ti.template()):
+    for i in ti.static(range(b.shape()[0])):
+        output[i] = 0.0
+    for i, j in ti.ndrange(b.shape()[0], b.shape()[0]):
+        output[i] += A[i, j] * b[j]
+
 
